@@ -1,0 +1,105 @@
+// Query: 01_extraction_and_enrichment.pq
+// Purpose: Extract daily slaughter data, clean client names,
+//          generate traceability code, and enrich with master registry
+//          via Left Outer Join on client name mapping.
+
+let
+    // --- STEP 1: Load source table from daily operational workbook ---
+    Origine = Excel.CurrentWorkbook(){[Name="OperationalData"]}[Content],
+
+    // --- STEP 2: Parse date column with Italian locale ---
+    #"Parse ExitDate" = Table.TransformColumnTypes(
+        Origine, 
+        {{"ExitDate", type date}}, 
+        "it-IT"
+    ),
+
+    // --- STEP 3: Build traceability code ---
+    // Format: CLIENTNAME-SlaughterNumber-Lot-EntryDate(yyyyMMdd)
+    // Handles nulls gracefully for each component
+    #"Add Traceability" = Table.AddColumn(
+        #"Parse ExitDate", 
+        "TraceabilityCode", 
+        each Text.Upper([ClientName])
+            & "-" & (if [SlaughterNumber] <> null and [SlaughterNumber] <> "" 
+                     then Text.From([SlaughterNumber]) else " ")
+            & (if [Lot] <> null and [Lot] <> "" 
+               then "-" & Text.From([Lot]) else "")
+            & "-" & (if [EntryDate] <> null 
+                     then Date.ToText(Date.From([EntryDate]), "yyyyMMdd") 
+                     else "NO_DATE")
+    ),
+
+    // --- STEP 4: Parse entry date ---
+    #"Parse EntryDate" = Table.TransformColumnTypes(
+        #"Add Traceability",
+        {{"EntryDate", type date}}
+    ),
+
+    // --- STEP 5: Normalize client name ---
+    // Remove special characters that break ERP fiscal matching
+    // Each replacement targets a known data quality issue
+    #"Remove Ampersand"    = Table.ReplaceValue(#"Parse EntryDate","&","E",Replacer.ReplaceText,{"ClientName"}),
+    #"Remove Quotes"       = Table.ReplaceValue(#"Remove Ampersand","""","",Replacer.ReplaceText,{"ClientName"}),
+    #"Normalize AZ AGR"    = Table.ReplaceValue(#"Remove Quotes","AZ.AGR.","AZ AGR",Replacer.ReplaceText,{"ClientName"}),
+    #"Normalize MAC AGR"   = Table.ReplaceValue(#"Normalize AZ AGR","MAC.AGR.","MAC AGR",Replacer.ReplaceText,{"ClientName"}),
+    #"Remove Dots"         = Table.ReplaceValue(#"Normalize MAC AGR",".","",Replacer.ReplaceText,{"ClientName"}),
+
+    // --- STEP 6: Uppercase species and notes columns ---
+    #"Uppercase Fields" = Table.TransformColumns(
+        #"Remove Dots",
+        {{"Species", Text.Upper, type text}, {"Notes", Text.Upper, type text}}
+    ),
+
+    // --- STEP 7: Left Outer Join with client master registry ---
+    // MAPPING_TABLE maps operational client names to ERP fiscal records
+    // LeftOuter preserves all operational records even if ERP match is missing
+    #"Join Master Registry" = Table.NestedJoin(
+        #"Uppercase Fields", 
+        {"ClientName"}, 
+        #"MAPPING_TABLE",   // Internal name anonymized
+        {"ERP_CLIENT_NAME"}, 
+        "MasterData", 
+        JoinKind.LeftOuter
+    ),
+
+    // --- STEP 8: Expand fiscal and address fields from master registry ---
+    #"Expand Master Fields" = Table.ExpandTableColumn(
+        #"Join Master Registry", 
+        "MasterData", 
+        {"FISCAL_ID", "CLIENT_CODE", "CLIENT_NAME", "CITY", 
+         "PROVINCE", "VAT_NUMBER", "FISCAL_CODE", "ADDRESS", 
+         "MOBILE", "PHONE"},
+        {"Master.FiscalID", "Master.ClientCode", "Master.ClientName", 
+         "Master.City", "Master.Province", "Master.VATNumber", 
+         "Master.FiscalCode", "Master.Address", "Master.Mobile", 
+         "Master.Phone"}
+    ),
+
+    // --- STEP 9: Derive delivery type from notes field ---
+    // "pickup" = client collects in person
+    // "processing" = routed to secondary processing unit
+    // Default = standard delivery to client city
+    // NOTE: candidate for dropdown field in OMS (backlog item)
+    #"Add DeliveryType" = Table.AddColumn(
+        #"Expand Master Fields", 
+        "DeliveryType", 
+        each if [Notes] <> null and Text.Contains(Text.From([Notes]), "pickup", Comparer.OrdinalIgnoreCase) 
+             then "PICKUP"
+        else if [Notes] <> null and Text.Contains(Text.From([Notes]), "processing", Comparer.OrdinalIgnoreCase) 
+             then "PROCESSING"
+        else [Master.City]
+    ),
+
+    // --- STEP 10: Uppercase delivery type, parse time as text ---
+    #"Uppercase DeliveryType" = Table.TransformColumns(
+        #"Add DeliveryType",
+        {{"DeliveryType", Text.Upper, type text}}
+    ),
+    #"Parse Time as Text" = Table.TransformColumnTypes(
+        #"Uppercase DeliveryType",
+        {{"Time", type text}}
+    )
+
+in
+    #"Parse Time as Text"
